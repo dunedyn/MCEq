@@ -869,6 +869,8 @@ class MCEqRun(object):
             self.density_model = dprof.MSIS00IceCubeCentered(*model_config)
         elif base_model == 'CORSIKA':
             self.density_model = dprof.CorsikaAtmosphere(*model_config)
+        elif base_model == 'AIRSNorth':
+            self.density_model = dprof.AIRSAtmosphereNorth(*model_config)
         elif base_model == 'AIRS':
             self.density_model = dprof.AIRSAtmosphere(*model_config)
         elif base_model == 'Isothermal':
