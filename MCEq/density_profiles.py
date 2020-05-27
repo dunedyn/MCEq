@@ -772,6 +772,235 @@ class MSIS00Atmosphere(EarthsAtmosphere):
           float: density :math:`T(h_{cm})` in K
         """
         return self._msis.get_temperature(h_cm)
+class AIRSAtmosphereNorth(EarthsAtmosphere):
+    """Interpolation class for tabulated atmospheres.
+
+    This class is intended to read preprocessed AIRS Satellite data.
+
+    Args:
+      location (int): see :func:`init_parameters`
+      season (str,optional): see :func:`init_parameters`
+    """
+    def __init__(self, location, season, extrapolate=True, *args, **kwargs):
+        if location.isdigit():            
+            location = int(location)
+        else:
+            raise Exception(self.__class__.__name__ +
+                           "(): location should be a latitude between 0 and 180. " +
+                           location)
+        if location > 180 or location <0:
+            raise Exception(self.__class__.__name__ +
+                           "(): location should be a latitude between 0 and 180. " +
+                           str(location))
+
+        self.extrapolate = extrapolate
+
+        self.month2doy = {
+            'January': 1,
+            'February': 32,
+            'March': 60,
+            'April': 91,
+            'May': 121,
+            'June': 152,
+            'July': 182,
+            'August': 213,
+            'September': 244,
+            'October': 274,
+            'November': 305,
+            'December': 335
+        }
+
+        self.season = season
+        self.init_parameters(location, **kwargs)
+        EarthsAtmosphere.__init__(self)
+
+    def init_parameters(self, location, **kwargs):
+        """Loads tables and prepares interpolation.
+
+        Args:
+          location (int): Latitude in degrees (0 to 180) 0=North Pole, 180=South Pole
+          doy (int): Day Of Year
+        """
+        from scipy.interpolate import interp1d
+        from matplotlib.dates import strpdate2num, num2date
+        from os import path
+        #This is a bruteforce path to takaos AIRS data on the IceCube Madison Server. This should be made more general in the future.
+        data_path = "/data/user/takao/analysis/airs/airx3std_v6_lat_daily/"
+
+        if 'table_path' in kwargs:
+            data_path = kwargs['table_path']
+        files = [('temp', 'airs_amsu_temp_%03i_daily.txt'%(location)),
+                 ('alti', 'airs_amsu_alti_%03i_daily.txt'%(location))]
+
+        data_collection = {}
+
+        # limit SouthPole pressure to <= 600
+        min_press_idx = 1
+
+        IC79_idx_1 = None
+        IC79_idx_2 = None
+
+        for d_key, fname in files:
+            fname = data_path  + fname
+            tab = np.loadtxt(fname,
+                             converters={0: strpdate2num('%Y/%m/%d')},
+                             usecols=[0] + list(range(2, 27)))
+            with open(fname, 'r') as f:
+                 comline = f.readline()
+            p_levels = [float(s.strip()) for s in comline.split(' ')[3:] if s != '' ][min_press_idx:]#hPa
+            dates = num2date(tab[:, 0])
+            for di, date in enumerate(dates):
+                if date.month == 6 and date.day == 1:
+                    if date.year == 2010:
+                        IC79_idx_1 = di
+                    elif date.year == 2011:
+                        IC79_idx_2 = di
+            surf_val = tab[:, 1]
+            cols = tab[:, min_press_idx + 2:]
+            data_collection[d_key] = (dates, surf_val, cols)
+
+        self.interp_tab_d = {}
+        self.interp_tab_t = {}
+        self.dates = {}
+        dates = data_collection['alti'][0]
+        msis = MSIS00Atmosphere("SouthPole", 'January')
+        msis._msis.set_location_coord(longitude=0.,latitude=90.-float(location))
+        for didx, date in enumerate(dates):
+            R = 8.314*1e6*1e-2# cm^3 hPa/K/mol (Ideal gas constant)
+            M = 28.964 #g/mol (molar density of Air)
+            h_vec = np.array(data_collection['alti'][2][didx, :] * 1e2)  #cm          
+            t_vec = np.array(data_collection['temp'][2][didx, :]) #K
+            d_vec = p_levels/t_vec*M/R #g/cm^3 (from ideal Gas Law)
+            h_vec = h_vec[np.isfinite(t_vec)&(t_vec>0)]
+            d_vec = d_vec[np.isfinite(t_vec)&(t_vec>0)]
+            t_vec = t_vec[np.isfinite(t_vec)&(t_vec>0)]
+            if self.extrapolate:
+                # Extrapolate using msis
+                msis._msis.set_doy(self._get_y_doy(date)[1] - 1)
+                if len(h_vec>0):
+                    h_extra = np.linspace(h_vec[-1], config.h_atm * 1e2, 250) 
+                else:                   
+                    self.interp_tab_d[self._get_y_doy(date)] =  lambda h: np.log(msis.get_density(h))
+                    self.interp_tab_t[self._get_y_doy(date)] =  lambda h: np.log(msis.get_temperature(h))
+                    self.dates[self._get_y_doy(date)] = date
+                    continue
+                
+                msis_extra_d = np.array([msis.get_density(h) for h in h_extra])
+                msis_extra_t = np.array([msis.get_temperature(h) for h in h_extra])
+
+                # Merge the two datasets
+                h_vec = np.hstack([h_vec[:-1], h_extra])
+                d_vec = np.hstack([d_vec[:-1], msis_extra_d])
+                t_vec = np.hstack([t_vec[:-1], msis_extra_t])
+            self.interp_tab_d[self._get_y_doy(date)] = interp1d(h_vec, np.log(d_vec),kind='cubic', fill_value = 'extrapolate')
+            self.interp_tab_t[self._get_y_doy(date)] = interp1d(h_vec, np.log(t_vec),kind='cubic', fill_value = 'extrapolate')
+            self.dates[self._get_y_doy(date)] = date
+
+        self.IC79_start = self._get_y_doy(dates[IC79_idx_1])
+        self.IC79_end = self._get_y_doy(dates[IC79_idx_2])
+        self.IC79_days = (dates[IC79_idx_2] - dates[IC79_idx_1]).days
+        self.location = location
+        if self.season is None:
+            self.set_IC79_day(0)
+        else:
+            self.set_season(self.season)
+        # Clear cached value to force spline recalculation
+        self.theta_deg = None
+        
+    def doy2month(self,doy):        
+        oldseason = None
+        for season in self.month2doy:
+            if (oldseason != None ) and doy < self.month2doy[season]:
+                return oldseason
+            elif doy >= 335:
+                return'December'            
+            oldseason = season
+    def set_location(self, location):
+        if location.isdigit():            
+            location = int(location)
+        else:
+            raise Exception(self.__class__.__name__ +
+                           "(): location should be a latitude between 0 and 180. " +
+                           location)
+        if location > 180 or location <0:
+            raise Exception(self.__class__.__name__ +
+                           "(): location should be a latitude between 0 and 180. " +
+                           str(location))
+        self.init_parameters(location)
+        #self.calculate_density_spline()
+    def set_date(self, year, doy):
+        self.dens = self.interp_tab_d[(year, doy)]
+        self.temp = self.interp_tab_t[(year, doy)]
+        self.date = self.dates[(year, doy)]
+        # Compatibility with caching
+        self.season = self.doy2month(doy)
+        self.calculate_density_spline()
+
+    def _set_doy(self, doy, year=2010):
+        self.dens = self.interp_tab_d[(year, doy)]
+        self.temp = self.interp_tab_t[(year, doy)]
+        self.date = self.dates[(year, doy)]
+    def set_season(self, month):
+        self.season = month
+        self._set_doy(self.month2doy[month])
+        self.season = month
+
+    def set_IC79_day(self, IC79_day):
+        import datetime
+        if IC79_day > self.IC79_days:
+            raise Exception(self.__class__.__name__ +
+                            "::set_IC79_day(): IC79_day above range.")
+        target_day = self._get_y_doy(self.dates[self.IC79_start] +
+                                     datetime.timedelta(days=IC79_day))
+        info(2, 'setting IC79_day', IC79_day)
+        self.dens = self.interp_tab_d[target_day]
+        self.temp = self.interp_tab_t[target_day]
+        self.date = self.dates[target_day]
+        # Compatibility with caching
+        self.season = self.date
+
+    def _get_y_doy(self, date):
+        return date.timetuple().tm_year, date.timetuple().tm_yday
+
+    def get_density(self, h_cm):
+        """ Returns the density of air in g/cm**3.
+
+        Interpolates table at requested value for previously set
+        year and day of year (doy).
+
+        Args:
+          h_cm (float): height in cm
+
+        Returns:
+          float: density :math:`\\rho(h_{cm})` in g/cm**3
+        """
+        ret = np.exp(self.dens(h_cm))#np.exp(np.interp(h_cm, self.h, np.log(self.dens)))
+        try:
+            ret[h_cm > config.h_atm*1e2] = np.nan
+        except TypeError:
+            if h_cm > config.h_atm*1e2:
+                return np.nan
+        return ret
+
+    def get_temperature(self, h_cm):
+        """ Returns the temperature in K.
+
+        Interpolates table at requested value for previously set
+        year and day of year (doy).
+
+        Args:
+          h_cm (float): height in cm
+
+        Returns:
+          float: temperature :math:`T(h_{cm})` in K
+        """
+        ret = np.exp(self.temp(h_cm))#np.exp(interp1d( self.h, np.log(self.temp))(h_cm))
+        try:
+            ret[h_cm > config.h_atm*1e2] = np.nan
+        except TypeError:
+            if h_cm > config.h_atm*1e2:
+                return np.nan
+        return ret
 
 class AIRSAtmosphere(EarthsAtmosphere):
 
